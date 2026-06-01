@@ -13,6 +13,15 @@ implementation and the scripts needed to reproduce the main paper pipeline.
 - `updates/`: CUDA update-overlay runners for Exact-CPU and PQ-GPU.
 - `configs/`: paper configuration templates for 1B and 100M experiments.
 
+## Update-Overlay Scope
+
+The PQ-GPU update release currently covers query-time overlay execution:
+published delta PQ segments are scanned and merged with the main PQ index during
+search.  The release does not include the full online insertion pipeline that
+assigns new vectors to nearest centroids and encodes them with residual-PQ
+codebooks; those build/publish steps are represented by the runner inputs and
+synthetic delta-code generation used for query-time overhead experiments.
+
 ## Build
 
 The original CMake project is preserved.  A typical build is:

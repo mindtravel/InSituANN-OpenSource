@@ -18,11 +18,14 @@
 #include <random>
 #include <thread>
 #include <unordered_set>
-#include <utility>`n#include "search/cpu_fine/cpu_fine.h"
+#include <utility>
+#include "search/cpu_fine/cpu_fine.h"
 #define CUDA_CHECK(x) do { cudaError_t err__=(x); if(err__!=cudaSuccess){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(err__)); exit(1);} } while(0)
-constexpr int DIM=128, M=16, K=256, DSUB=8, RERANK=512, LOCAL_K=256, TPB=256, CHUNK=2048, GROUP_CHUNKS=8;
+constexpr int DIM=128, MAX_M=32, K=256, MAX_DSUB=8, RERANK=512, LOCAL_K=256, TPB=256, CHUNK=2048, GROUP_CHUNKS=8;
 constexpr int DELTA_TOPK=16, COMBINED_CAND=RERANK+DELTA_TOPK;
 static int64_t gN = 1000000000LL;
+static int pq_m = 16;
+static int pq_dsub = 8;
 struct ChunkDesc { int qi, cid, start, len; };
 struct GroupDesc { int qi, chunk_start, nchunks; };
 static double wall_now_ms(){
@@ -42,24 +45,24 @@ static uint64_t splitmix64(uint64_t x){x+=0x9e3779b97f4a7c15ULL;x=(x^(x>>30))*0x
 static bool is_deleted_id(int id,double ratio){if(ratio<=0.0||id<0)return false;if(ratio>=1.0)return true;long double th=ratio*(long double)std::numeric_limits<uint64_t>::max();return (long double)splitmix64((uint64_t)id)<th;}
 static std::vector<float> read_centroids(const std::string& path,int nlist){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int32_t nl=0,dim=0;f.read((char*)&nl,4);f.read((char*)&dim,4);if(nl!=nlist||dim!=DIM){std::cerr<<"bad centroids\n";exit(1);}std::vector<float> v((size_t)nlist*dim);f.read((char*)v.data(),v.size()*4);return v;}
 static std::vector<int32_t> read_assign(const std::string& path){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int64_t n=0;f.read((char*)&n,8);if(n!=gN){std::cerr<<"bad assign "<<n<<" expected "<<gN<<"\n";exit(1);}std::vector<int32_t>a(n);f.read((char*)a.data(),a.size()*4);return a;}
-static std::vector<float> read_codebook(const std::string& path){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int32_t m=0,k=0,dsub=0,pad=0;f.read((char*)&m,4);f.read((char*)&k,4);f.read((char*)&dsub,4);f.read((char*)&pad,4);if(m!=M||k!=K||dsub!=DSUB){std::cerr<<"bad cb\n";exit(1);}std::vector<float>v((size_t)M*K*DSUB);f.read((char*)v.data(),v.size()*4);return v;}
-static std::vector<uint8_t> read_codes(const std::string& path){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int64_t n=0;int32_t m=0,pad=0;f.read((char*)&n,8);f.read((char*)&m,4);f.read((char*)&pad,4);if(n!=gN||m!=M){std::cerr<<"bad codes "<<n<<" m="<<m<<" expected "<<gN<<"\n";exit(1);}std::vector<uint8_t>v((size_t)n*M);f.read((char*)v.data(),v.size());return v;}
+static std::vector<float> read_codebook(const std::string& path){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int32_t m=0,k=0,dsub=0,pad=0;f.read((char*)&m,4);f.read((char*)&k,4);f.read((char*)&dsub,4);f.read((char*)&pad,4);if(m!=pq_m||k!=K||dsub!=pq_dsub){std::cerr<<"bad cb m="<<m<<" k="<<k<<" dsub="<<dsub<<" expected m="<<pq_m<<" k="<<K<<" dsub="<<pq_dsub<<"\n";exit(1);}std::vector<float>v((size_t)pq_m*K*pq_dsub);f.read((char*)v.data(),v.size()*4);return v;}
+static std::vector<uint8_t> read_codes(const std::string& path){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int64_t n=0;int32_t m=0,pad=0;f.read((char*)&n,8);f.read((char*)&m,4);f.read((char*)&pad,4);if(n!=gN||m!=pq_m){std::cerr<<"bad codes "<<n<<" m="<<m<<" expected n="<<gN<<" m="<<pq_m<<"\n";exit(1);}std::vector<uint8_t>v((size_t)n*pq_m);f.read((char*)v.data(),v.size());return v;}
 static std::vector<float> read_queries(const std::string& path,int bs){std::ifstream f(path,std::ios::binary);if(!f){perror(path.c_str());exit(1);}int32_t nq=0,dim=0;f.read((char*)&nq,4);f.read((char*)&dim,4);if(dim!=DIM||nq<bs){std::cerr<<"bad query\n";exit(1);}std::vector<uint8_t>u((size_t)bs*dim);f.read((char*)u.data(),u.size());std::vector<float>q(u.size());for(size_t i=0;i<u.size();++i)q[i]=(float)u[i];return q;}
 static std::vector<int> counts_from_assign(const std::vector<int32_t>& a,int nlist){std::vector<int>c(nlist);for(int x:a)c[x]++;return c;} static std::vector<long long> offsets_from_counts(const std::vector<int>& c){std::vector<long long>o(c.size());for(size_t i=1;i<c.size();++i)o[i]=o[i-1]+c[i-1];return o;}
 __global__ void coarse_dist_kernel(const float*q,const float*cent,float*dists,int bs,int nlist){int idx=blockIdx.x*blockDim.x+threadIdx.x,total=bs*nlist;if(idx>=total)return;int qi=idx/nlist,cid=idx-qi*nlist;float d=0;const float*qq=q+(size_t)qi*DIM;const float*cc=cent+(size_t)cid*DIM;for(int j=0;j<DIM;j++){float x=qq[j]-cc[j];d+=x*x;}dists[idx]=d;}
 __global__ void coarse_select_exact_kernel(const float*dists,int*out_ids,float*out_dist,int bs,int nlist,int nprobe){int qi=blockIdx.x;if(qi>=bs||threadIdx.x)return;extern __shared__ unsigned char sm[];float*bd=(float*)sm;int*bi=(int*)(bd+nprobe);for(int k=0;k<nprobe;k++){bd[k]=1e30f;bi[k]=-1;}const float*row=dists+(size_t)qi*nlist;for(int c=0;c<nlist;c++){float d=row[c];int worst=0;float wd=bd[0];for(int k=1;k<nprobe;k++)if(bd[k]>wd){wd=bd[k];worst=k;}if(d<wd){bd[worst]=d;bi[worst]=c;}}for(int a=0;a<nprobe;a++)for(int b=a+1;b<nprobe;b++)if(bd[b]<bd[a]){float td=bd[a];bd[a]=bd[b];bd[b]=td;int ti=bi[a];bi[a]=bi[b];bi[b]=ti;}for(int k=0;k<nprobe;k++){out_ids[qi*nprobe+k]=bi[k];out_dist[qi*nprobe+k]=bd[k];}}
 __device__ inline void sort_pair(float&a,int&ia,float&b,int&ib,bool asc){bool sw=asc?(a>b):(a<b);if(sw){float td=a;a=b;b=td;int ti=ia;ia=ib;ib=ti;}}
-__global__ void chunk_top256_select_kernel(const float*q,const float*cent,const float*cb,const uint8_t*codes,const long long*offsets,const ChunkDesc*desc,int nchunks,float*outd,int*outi){
-  __shared__ float lut[M*K];
+__global__ void chunk_top256_select_kernel(const float*q,const float*cent,const float*cb,const uint8_t*codes,const long long*offsets,const ChunkDesc*desc,int nchunks,float*outd,int*outi,int pq_m_kernel,int pq_dsub_kernel){
+  __shared__ float lut[MAX_M*K];
   __shared__ float sd[LOCAL_K];
   __shared__ int si[LOCAL_K];
   int bid=blockIdx.x; if(bid>=nchunks)return;
   ChunkDesc cd=desc[bid];
   const float*qq=q+(size_t)cd.qi*DIM;
   const float*cc=cent+(size_t)cd.cid*DIM;
-  for(int e=threadIdx.x;e<M*K;e+=blockDim.x){
-    int m=e/K,kk=e-m*K; const float*cw=cb+((m*K+kk)*DSUB); float s=0;
-    for(int j=0;j<DSUB;j++){float r=qq[m*DSUB+j]-cc[m*DSUB+j]; float x=r-cw[j]; s+=x*x;}
+  for(int e=threadIdx.x;e<pq_m_kernel*K;e+=blockDim.x){
+    int m=e/K,kk=e-m*K; const float*cw=cb+((m*K+kk)*pq_dsub_kernel); float s=0;
+    for(int j=0;j<pq_dsub_kernel;j++){float r=qq[m*pq_dsub_kernel+j]-cc[m*pq_dsub_kernel+j]; float x=r-cw[j]; s+=x*x;}
     lut[e]=s;
   }
   __syncthreads();
@@ -67,8 +70,8 @@ __global__ void chunk_top256_select_kernel(const float*q,const float*cent,const 
   float best=1e30f; int besti=-1;
   for(int x=threadIdx.x;x<CHUNK;x+=blockDim.x){
     if(x<cd.len){
-      int idx=(int)(off+x); const uint8_t*code=codes+(size_t)idx*M; float d=0;
-      for(int m=0;m<M;m++) d+=lut[m*K+code[m]];
+      int idx=(int)(off+x); const uint8_t*code=codes+(size_t)idx*pq_m_kernel; float d=0;
+      for(int m=0;m<pq_m_kernel;m++) d+=lut[m*K+code[m]];
       if(d<best){best=d; besti=idx;}
     }
   }
@@ -113,10 +116,10 @@ __global__ void group_merge_kernel(const GroupDesc*gdesc,int ngroups,const float
 __global__ void final_merge_kernel(const int* qgstart,const int* qgcount,const float*gd,const int*gi,float*outd,int*outi,int bs){int qi=blockIdx.x;if(qi>=bs||threadIdx.x)return;float topd[RERANK];int topi[RERANK];for(int k=0;k<RERANK;k++){topd[k]=1e30f;topi[k]=-1;}int st=qgstart[qi],cnt=qgcount[qi];for(int g=0;g<cnt;g++)for(int k=0;k<RERANK;k++){float d=gd[(size_t)(st+g)*RERANK+k];int idx=gi[(size_t)(st+g)*RERANK+k];int worst=0;float wd=topd[0];for(int t=1;t<RERANK;t++)if(topd[t]>wd){wd=topd[t];worst=t;}if(d<wd){topd[worst]=d;topi[worst]=idx;}}for(int a=0;a<RERANK;a++)for(int b=a+1;b<RERANK;b++)if(topd[b]<topd[a]){float td=topd[a];topd[a]=topd[b];topd[b]=td;int ti=topi[a];topi[a]=topi[b];topi[b]=ti;}for(int k=0;k<RERANK;k++){outd[qi*RERANK+k]=topd[k];outi[qi*RERANK+k]=topi[k];}}
 __global__ void fused_first_group_merge_kernel(
   const float*q,const float*cent,const float*cb,const uint8_t*codes,const long long*offsets,
-  const ChunkDesc*desc,const GroupDesc*gdesc,int ngroups,float*outd,int*outi){
+  const ChunkDesc*desc,const GroupDesc*gdesc,int ngroups,float*outd,int*outi,int pq_m_kernel,int pq_dsub_kernel){
   extern __shared__ unsigned char sm[];
   float* sd=(float*)sm; int* si=(int*)(sd+GROUP_CHUNKS*LOCAL_K);
-  __shared__ float lut[M*K];
+  __shared__ float lut[MAX_M*K];
   int gid=blockIdx.x; if(gid>=ngroups)return;
   GroupDesc gd=gdesc[gid];
 
@@ -124,9 +127,9 @@ __global__ void fused_first_group_merge_kernel(
     ChunkDesc cd=desc[gd.chunk_start+ch];
     const float* qq=q+(size_t)cd.qi*DIM;
     const float* cc=cent+(size_t)cd.cid*DIM;
-    for(int e=threadIdx.x; e<M*K; e+=blockDim.x){
-      int m=e/K,kk=e-m*K; const float*cw=cb+((m*K+kk)*DSUB); float s=0;
-      for(int j=0;j<DSUB;j++){float r=qq[m*DSUB+j]-cc[m*DSUB+j]; float x=r-cw[j]; s+=x*x;}
+    for(int e=threadIdx.x; e<pq_m_kernel*K; e+=blockDim.x){
+      int m=e/K,kk=e-m*K; const float*cw=cb+((m*K+kk)*pq_dsub_kernel); float s=0;
+      for(int j=0;j<pq_dsub_kernel;j++){float r=qq[m*pq_dsub_kernel+j]-cc[m*pq_dsub_kernel+j]; float x=r-cw[j]; s+=x*x;}
       lut[e]=s;
     }
     __syncthreads();
@@ -136,8 +139,8 @@ __global__ void fused_first_group_merge_kernel(
       float best=1e30f; int besti=-1;
       for(int item=lane; item<CHUNK; item+=LOCAL_K){
         if(item<cd.len){
-          int idx=(int)(off+item); const uint8_t*code=codes+(size_t)idx*M; float d=0;
-          for(int m=0;m<M;m++) d+=lut[m*K+code[m]];
+          int idx=(int)(off+item); const uint8_t*code=codes+(size_t)idx*pq_m_kernel; float d=0;
+          for(int m=0;m<pq_m_kernel;m++) d+=lut[m*K+code[m]];
           if(d<best){best=d; besti=idx;}
         }
       }
@@ -465,13 +468,13 @@ static DeltaPqGpuSegment build_delta_pq_mutable_publish(int active_n, int nlist,
     nonempty+=(cnt>0);
   }
   for(int c=1;c<nlist;c++) seg.offsets[(size_t)c]=seg.offsets[(size_t)c-1]+seg.counts[(size_t)c-1];
-  seg.codes.assign((size_t)active_n * M, 0);
+  seg.codes.assign((size_t)active_n * pq_m, 0);
   seg.ids.assign((size_t)active_n, -1);
   for(int c=0;c<nlist;c++){
     long long dst=seg.offsets[(size_t)c];
     for(int local_id: mutable_delta_lists[(size_t)c]){
-      uint8_t* out_code=seg.codes.data()+(size_t)dst*M;
-      for(int m=0;m<M;m++) out_code[m]=synthetic_delta_pq_code(local_id,m);
+      uint8_t* out_code=seg.codes.data()+(size_t)dst*pq_m;
+      for(int m=0;m<pq_m;m++) out_code[m]=synthetic_delta_pq_code(local_id,m);
       seg.ids[(size_t)dst]=base_id+local_id;
       ++dst;
     }
@@ -649,17 +652,18 @@ int main(int argc,char**argv){
   std::vector<std::pair<int,int>> configs;
   int bss_full[]={8,2048}; int nps_full[]={160,192,224};
   if(ds=="sift10m"){
-    gN=10000000LL; nlist=4096; root="/workspace/results/sift10m";
+    gN=10000000LL; nlist=4096; pq_m=16; pq_dsub=8; root="/workspace/results/sift10m";
     base_path="/workspace/sift1b/base_1b.bin"; query_path="/workspace/sift1b/query.bin"; gt_path="/dev/shm/sift1b/groundtruth_10m.bin";
     cent_path=root+"/centroids/centroids_10m_nlist4096.bin"; assign_path=root+"/assign_10m_nlist4096.bin";
     cb_path=root+"/pq/codebook_resid_10m_nlist4096.bin"; codes_path=root+"/pq/pq_codes_resid_10m_nlist4096.bin";
   } else if(ds=="sift100m"){
-    gN=100000000LL; nlist=32768; root="/workspace/results/sift100m";
+    gN=100000000LL; nlist=131072; pq_m=32; pq_dsub=4; root="/workspace/results/sift100m";
     base_path="/workspace/sift1b/base_1b.bin"; query_path="/workspace/sift1b/query.bin"; gt_path="/workspace/data/sift100m/groundtruth.bin";
-    cent_path=root+"/centroids/centroids_100m_nlist32768.bin"; assign_path=root+"/assign_100m_nlist32768.bin";
-    cb_path=root+"/pq/codebook_resid_100m_nlist32768.bin"; codes_path=root+"/pq/pq_codes_resid_100m_nlist32768.bin";
+    cent_path=root+"/centroids/centroids_100m_nlist131072.bin"; assign_path=root+"/assign_100m_nlist131072.bin";
+    cb_path=root+"/pq_highm_full100m_iter10/codebook_resid_M32_100m_nlist131072_full100mKMeans_iter10_train4m.bin";
+    codes_path=root+"/pq_highm_full100m_iter10/pq_codes_resid_M32_100m_nlist131072_full100mKMeans_iter10_train4m.bin";
   } else if(ds=="sift1b"){
-    gN=1000000000LL; nlist=524288; root="/workspace/results/sift1b";
+    gN=1000000000LL; nlist=524288; pq_m=16; pq_dsub=8; root="/workspace/results/sift1b";
     base_path="/workspace/sift1b/base_1b.bin"; query_path="/workspace/sift1b/query.bin"; gt_path="/workspace/sift1b/gt.bin";
     cent_path="/workspace/results/sift1b/centroids/centroids_1b_nlist524288_train1b_iter10_8gpu.bin"; assign_path="/workspace/results/sift1b/assign_1b_nlist524288_train1b_iter10_8gpu.bin";
     cb_path="/workspace/results/sift1b/pq/codebook_resid_M16_1b_nlist524288_train1b_iter10_8gpu.bin";
@@ -688,7 +692,11 @@ int main(int argc,char**argv){
     for(int id: gt100) if(id>=0) delete_protect_gt.insert(id);
     std::cerr<<"[DELETE] GT-safe protect ids="<<delete_protect_gt.size()<<"\n";
   }
-  std::cerr<<"loaded "<<ds<<" full-e2e n="<<gN<<" nlist="<<nlist<<" configs="<<configs.size()<<" repeats="<<repeats<<" mem_available_gib_after_load="<<read_mem_available_gib()<<"\n";
+  if(pq_m <= 0 || pq_m > MAX_M || pq_dsub <= 0 || pq_dsub > MAX_DSUB || pq_m * pq_dsub != DIM){
+    std::cerr<<"bad PQ layout m="<<pq_m<<" dsub="<<pq_dsub<<" dim="<<DIM<<"\n";
+    return 2;
+  }
+  std::cerr<<"loaded "<<ds<<" full-e2e n="<<gN<<" nlist="<<nlist<<" pq_m="<<pq_m<<" pq_dsub="<<pq_dsub<<" configs="<<configs.size()<<" repeats="<<repeats<<" mem_available_gib_after_load="<<read_mem_available_gib()<<"\n";
 
   float *dc=nullptr,*dcb=nullptr; uint8_t* dcodes=nullptr; long long* doff=nullptr; int* dcounts=nullptr;
   CUDA_CHECK(cudaMalloc(&dc,cent.size()*sizeof(float)));
@@ -703,9 +711,9 @@ int main(int argc,char**argv){
   std::vector<uint8_t> delta_u8;
   std::vector<DeltaPqGpuSegment> delta_pq_segments;
   if(update_mode){
-    const int max_delta_n=50000000;
+    const int max_delta_n=100000000;
     delta_u8=make_random_delta_u8(max_delta_n, 20260531ULL);
-    for(int dn: {10000000,50000000}){
+    for(int dn: {10000000,50000000,100000000}){
       auto seg=build_delta_pq_mutable_publish(dn,nlist,(int)gN);
       auto t0=std::chrono::high_resolution_clock::now();
       seg.upload();
@@ -740,7 +748,7 @@ int main(int argc,char**argv){
   for(auto cfg: configs){
     int bs=cfg.first, nprobe=cfg.second;
     std::vector<std::pair<int,int>> run_pairs;
-    if(update_mode) run_pairs={{0,0},{0,50000000},{50000000,0},{50000000,50000000},{10000000,10000000},{10000000,50000000},{50000000,10000000}};
+    if(update_mode) run_pairs={{0,0},{0,50000000},{50000000,0},{50000000,50000000},{10000000,10000000},{10000000,50000000},{50000000,10000000},{100000000,100000000}};
     else run_pairs={{0,0}};
     for(auto update_pair: run_pairs){
     int active_delta_n=update_pair.first;
@@ -930,7 +938,7 @@ int main(int argc,char**argv){
           ensure_int(&ws_merge_a_i,cap_merge_a_i,(size_t)first_groups*RERANK);
 
           CUDA_CHECK(cudaEventRecord(evs));
-          fused_first_group_merge_kernel<<<first_groups,1024,GROUP_CHUNKS*LOCAL_K*(sizeof(float)+sizeof(int))>>>(ws_dq,dc,dcb,dcodes,doff,ws_ddesc,ws_gdesc,first_groups,ws_merge_a_d,ws_merge_a_i);
+          fused_first_group_merge_kernel<<<first_groups,1024,GROUP_CHUNKS*LOCAL_K*(sizeof(float)+sizeof(int))>>>(ws_dq,dc,dcb,dcodes,doff,ws_ddesc,ws_gdesc,first_groups,ws_merge_a_d,ws_merge_a_i,pq_m,pq_dsub);
           CUDA_CHECK(cudaEventRecord(eve)); CUDA_CHECK(cudaEventSynchronize(eve)); CUDA_CHECK(cudaEventElapsedTime(&chunkms,evs,eve)); CUDA_CHECK(cudaGetLastError());
           float* curd=ws_merge_a_d; int* curi=ws_merge_a_i; int* cur_start=first_start; int* cur_count=first_count; size_t cur_groups=first_groups; int cur_stride=RERANK; int initial_ngroups=first_groups; bool first_group_round=false;
           while(true){
@@ -1002,7 +1010,7 @@ int main(int argc,char**argv){
 
               float delta_chunkms=0.f, delta_groupms=0.f, delta_finalms=0.f, delta_d2h=0.f;
               CUDA_CHECK(cudaEventRecord(evs));
-              fused_first_group_merge_kernel<<<delta_first_groups,1024,GROUP_CHUNKS*LOCAL_K*(sizeof(float)+sizeof(int))>>>(ws_dq,dc,dcb,active_delta_seg->d_codes,active_delta_seg->d_offsets,ws_ddesc,ws_gdesc,delta_first_groups,ws_merge_a_d,ws_merge_a_i);
+              fused_first_group_merge_kernel<<<delta_first_groups,1024,GROUP_CHUNKS*LOCAL_K*(sizeof(float)+sizeof(int))>>>(ws_dq,dc,dcb,active_delta_seg->d_codes,active_delta_seg->d_offsets,ws_ddesc,ws_gdesc,delta_first_groups,ws_merge_a_d,ws_merge_a_i,pq_m,pq_dsub);
               CUDA_CHECK(cudaEventRecord(eve)); CUDA_CHECK(cudaEventSynchronize(eve)); CUDA_CHECK(cudaEventElapsedTime(&delta_chunkms,evs,eve)); CUDA_CHECK(cudaGetLastError());
 
               float* dcurd=ws_merge_a_d; int* dcuri=ws_merge_a_i; int* dcur_start=delta_first_start; int* dcur_count=delta_first_count; size_t dcur_groups=delta_first_groups; int dcur_stride=RERANK; int delta_initial_groups=delta_first_groups;
