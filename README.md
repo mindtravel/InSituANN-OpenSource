@@ -1,9 +1,7 @@
 # InSituANN Open-Source Release
 
 This is the open-source release for InSituANN.  It keeps the core
-implementation and the scripts needed to reproduce the main paper pipeline,
-while leaving out exploratory kernels, temporary remote scripts, large datasets,
-and large generated result directories.
+implementation and the scripts needed to reproduce the main paper pipeline.
 
 ## What Is Included
 
@@ -14,21 +12,6 @@ and large generated result directories.
   training, and fast-build scripts.
 - `updates/`: CUDA update-overlay runners for Exact-CPU and PQ-GPU.
 - `configs/`: paper configuration templates for 1B and 100M experiments.
-
-## What Is Not Included
-
-- Raw vectors, ground truth files, centroids, assignment arrays, reordered
-  vectors, PQ codes, and other large artifacts.
-- Paper evaluation CSVs, plotting scripts, and full experiment result
-  directories.
-- Draft notes, paper figures, local documents, and intermediate experiment logs.
-- Internal validation suites and local datasets.
-- Generated paper runners and external launch scripts.
-- Legacy exploratory implementations such as AoSoA/warpsort variants, IMI,
-  OPQ/RabitQ experiments, failed fused-assignment prototypes, and temporary
-  remote patches.
-- Provider credentials, SSH settings, API keys, or machine-specific launch
-  state.
 
 ## Build
 
