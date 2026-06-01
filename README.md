@@ -12,8 +12,7 @@ and large generated result directories.
   shared GPU utilities.
 - `scripts/`: selected dataset conversion, ground-truth generation, PQ
   training, and fast-build scripts.
-- `dynamic_updates/`: compact reference implementation of snapshot-delta update
-  semantics.
+- `updates/`: CUDA update-overlay runners for Exact-CPU and PQ-GPU.
 - `configs/`: paper configuration templates for 1B and 100M experiments.
 
 ## What Is Not Included
@@ -24,7 +23,7 @@ and large generated result directories.
   directories.
 - Draft notes, paper figures, local documents, and intermediate experiment logs.
 - Internal validation suites and local datasets.
-- Generated paper runners and update-performance runners.
+- Generated paper runners and external launch scripts.
 - Legacy exploratory implementations such as AoSoA/warpsort variants, IMI,
   OPQ/RabitQ experiments, failed fused-assignment prototypes, and temporary
   remote patches.
@@ -42,6 +41,13 @@ cmake --build build -j
 
 For older GPUs, replace `120` with the correct CUDA architecture.  The code was
 developed with CUDA 13.0 and C++17.
+
+The update-overlay runners can be built after the core project libraries:
+
+```bash
+cd updates
+./build.sh
+```
 
 ## Reproducing Paper Results
 
