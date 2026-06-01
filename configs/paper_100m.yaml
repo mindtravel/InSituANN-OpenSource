@@ -1,0 +1,44 @@
+# InSituANN 100M-scale paper configuration template.
+
+common:
+  query_count: 10000
+  batch_sizes: [8, 32, 256, 2048]
+  nprobe_sweep: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512]
+  metric: recall_at_10
+  rerank_budget: 512
+  query_time_gpus: 1
+
+datasets:
+  sift100m:
+    dim: 128
+    base_count: 100000000
+    stored_type: uint8
+    nlist: 131072
+    pq:
+      M: 32
+      K: 256
+      train_residual_samples: 4000000
+      bits_per_subcode: 8
+      lut_precision: fp32
+  deep100m:
+    dim: 96
+    base_count: 100000000
+    stored_type: float32
+    nlist: 131072
+    pq:
+      M: 32
+      K: 256
+      train_residual_samples: 4000000
+      bits_per_subcode: 8
+      lut_precision: fp32
+  spacev100m:
+    dim: 100
+    base_count: 100000000
+    stored_type: int8
+    nlist: 131072
+    pq:
+      M: 50
+      K: 256
+      train_residual_samples: 4000000
+      bits_per_subcode: 8
+      lut_precision: fp32

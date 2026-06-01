@@ -1,0 +1,67 @@
+# InSituANN 1B-scale paper configuration template.
+
+common:
+  query_count: 10000
+  batch_sizes: [8, 32, 256, 2048]
+  nprobe_sweep: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512]
+  metric: recall_at_10
+  rerank_budget: 512
+  query_time_gpus: 1
+
+datasets:
+  sift1b:
+    dim: 128
+    base_count: 1000000000
+    stored_type: uint8
+    nlist: 524288
+    exact_cpu:
+      cpu_threads: 64
+      search_layout: touched_cluster_major
+    pq:
+      M: 16
+      K: 256
+      bits_per_subcode: 8
+      lut_precision: fp32
+      code_residency_pq_gpu: gpu_vram
+      code_residency_pq_cpu: host_dram
+  deep1b:
+    dim: 96
+    base_count: 1000000000
+    stored_type: float32
+    nlist: 524288
+    exact_cpu:
+      cpu_threads: 64
+      search_layout: touched_cluster_major
+    pq:
+      M: 16
+      K: 256
+      bits_per_subcode: 8
+      lut_precision: fp32
+      code_residency_pq_gpu: gpu_vram
+      code_residency_pq_cpu: host_dram
+  spacev1b:
+    dim: 100
+    base_count: 1402020720
+    stored_type: int8
+    nlist: 524288
+    exact_cpu:
+      cpu_threads: 64
+      search_layout: touched_cluster_major
+    pq:
+      M: 20
+      K: 256
+      bits_per_subcode: 8
+      lut_precision: fp32
+      code_residency_pq_gpu: gpu_vram
+      code_residency_pq_cpu: host_dram
+
+latency_points:
+  sift1b:
+    gpu_pq_nprobe: 80
+    exact_cpu_nprobe: 80
+  deep1b:
+    gpu_pq_nprobe: 64
+    exact_cpu_nprobe: 64
+  spacev1b:
+    gpu_pq_nprobe: 128
+    exact_cpu_nprobe: 32
